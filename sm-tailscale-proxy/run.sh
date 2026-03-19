@@ -1,11 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# SM Tailscale Proxy Add-on for Home Assistant
+# SM Tailscale Proxy Add-on for Home Assistant v1.2.0
 # Runs Tailscale exit node + SOCKS5 proxy + management reporting
 # =============================================================================
-set -e
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Read config from HA add-on options
 CONFIG="/data/options.json"
@@ -46,7 +45,7 @@ echo ""
 # Enable IP forwarding
 # ============================================================
 echo "[1/4] Enabling IP forwarding..."
-echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "  Warning: Could not set ipv4 forwarding (may need host config)"
 echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
 echo "  Done."
 
@@ -57,27 +56,70 @@ echo "[2/4] Starting Tailscale..."
 
 # Persist Tailscale state across restarts
 mkdir -p /data/tailscale
+mkdir -p /var/run/tailscale
+
+# Create TUN device if it doesn't exist
+if [ ! -c /dev/net/tun ]; then
+    echo "  Creating TUN device..."
+    mkdir -p /dev/net
+    mknod /dev/net/tun c 10 200 2>/dev/null || true
+    chmod 600 /dev/net/tun 2>/dev/null || true
+fi
+
+# Determine TUN mode - prefer kernel tun for exit node, fallback to userspace
+TUN_MODE=""
+if [ -c /dev/net/tun ]; then
+    echo "  TUN device available — using kernel networking (exit node capable)"
+    TUN_MODE=""
+else
+    echo "  WARNING: No TUN device — using userspace networking (exit node will NOT work)"
+    TUN_MODE="--tun=userspace-networking"
+fi
 
 # Start tailscaled daemon
 tailscaled \
     --state=/data/tailscale/tailscaled.state \
     --socket=/var/run/tailscale/tailscaled.sock \
-    --tun=userspace-networking &
+    $TUN_MODE &
+TAILSCALED_PID=$!
 
-sleep 3
+# Wait for tailscaled to be ready
+echo "  Waiting for tailscaled..."
+for i in $(seq 1 30); do
+    if tailscale status 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
 
 # Check if already authenticated
-if tailscale status --json 2>/dev/null | jq -e '.Self.Online' > /dev/null 2>&1; then
-    echo "  Already connected."
+TS_STATUS=$(tailscale status --json 2>/dev/null | jq -r '.Self.Online // false' 2>/dev/null || echo "false")
+
+if [ "$TS_STATUS" = "true" ]; then
+    echo "  Already connected — updating config..."
+    tailscale set --advertise-exit-node --hostname="$NODE_ID" 2>/dev/null || \
     tailscale up --advertise-exit-node --hostname="$NODE_ID" --reset 2>/dev/null || true
 else
     echo ""
     echo "  ================================================"
     echo "  TAILSCALE AUTH REQUIRED"
-    echo "  Check the add-on logs for the login URL"
+    echo "  A login URL will appear below."
+    echo "  Open it in your browser to authenticate."
     echo "  ================================================"
     echo ""
-    tailscale up --advertise-exit-node --hostname="$NODE_ID" 2>&1 || true
+    # Run in background so script continues even if auth takes time
+    tailscale up --advertise-exit-node --hostname="$NODE_ID" &
+    TS_UP_PID=$!
+
+    # Wait up to 120 seconds for auth
+    for i in $(seq 1 120); do
+        TS_CHECK=$(tailscale status --json 2>/dev/null | jq -r '.Self.Online // false' 2>/dev/null || echo "false")
+        if [ "$TS_CHECK" = "true" ]; then
+            echo "  Authenticated successfully!"
+            break
+        fi
+        sleep 1
+    done
 fi
 
 TS_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
@@ -90,40 +132,43 @@ echo ""
 echo "[3/4] Starting SOCKS5 proxy on port $SOCKS_PORT..."
 microsocks -i 0.0.0.0 -p "$SOCKS_PORT" &
 SOCKS_PID=$!
-echo "  SOCKS5 PID: $SOCKS_PID"
+sleep 1
+if kill -0 $SOCKS_PID 2>/dev/null; then
+    echo "  SOCKS5 running (PID: $SOCKS_PID)"
+else
+    echo "  ERROR: microsocks failed to start"
+fi
 
 # ============================================================
 # IP Intelligence + Registration
 # ============================================================
 echo "[4/4] Detecting IP and registering..."
-register_node() {
-    PUB_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "unknown")
-    IP_DATA=$(curl -sf --max-time 5 "http://ip-api.com/json/$PUB_IP?fields=status,city,regionName,country,isp,org,as,hosting" 2>/dev/null || echo "{}")
 
-    IP_CITY=$(echo "$IP_DATA" | jq -r '.city // ""' 2>/dev/null)
-    IP_REGION=$(echo "$IP_DATA" | jq -r '.regionName // ""' 2>/dev/null)
-    IP_COUNTRY=$(echo "$IP_DATA" | jq -r '.country // ""' 2>/dev/null)
-    IP_ISP=$(echo "$IP_DATA" | jq -r '.isp // ""' 2>/dev/null)
-    IP_ORG=$(echo "$IP_DATA" | jq -r '.org // ""' 2>/dev/null)
-    IP_ASN=$(echo "$IP_DATA" | jq -r '.as // ""' 2>/dev/null)
-    IP_HOSTING=$(echo "$IP_DATA" | jq -r '.hosting // false' 2>/dev/null)
+PUB_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "unknown")
+IP_DATA=$(curl -sf --max-time 5 "http://ip-api.com/json/$PUB_IP?fields=status,city,regionName,country,isp,org,as,hosting" 2>/dev/null || echo "{}")
 
-    IP_TYPE="business"
-    if [ "$IP_HOSTING" = "true" ]; then
-        IP_TYPE="datacenter"
-    else
-        ISP_L=$(echo "$IP_ISP" | tr '[:upper:]' '[:lower:]')
-        case "$ISP_L" in
-            *comcast*|*spectrum*|*at\&t*|*verizon*|*cox*|*frontier*|*charter*|*t-mobile*|*centurylink*|*mediacom*|*xfinity*|*optimum*|*starlink*|*hughesnet*|*brightspeed*|*ziply*|*suddenlink*|*altice*|*astound*|*wow*|*breezeline*|*cable*one*|*midco*|*windstream*|*earthlink*|*consolidated*)
-                IP_TYPE="residential" ;;
-        esac
-    fi
+IP_CITY=$(echo "$IP_DATA" | jq -r '.city // ""' 2>/dev/null)
+IP_REGION=$(echo "$IP_DATA" | jq -r '.regionName // ""' 2>/dev/null)
+IP_COUNTRY=$(echo "$IP_DATA" | jq -r '.country // ""' 2>/dev/null)
+IP_ISP=$(echo "$IP_DATA" | jq -r '.isp // ""' 2>/dev/null)
+IP_ORG=$(echo "$IP_DATA" | jq -r '.org // ""' 2>/dev/null)
+IP_ASN=$(echo "$IP_DATA" | jq -r '.as // ""' 2>/dev/null)
+IP_HOSTING=$(echo "$IP_DATA" | jq -r '.hosting // false' 2>/dev/null)
 
-    echo "  Public IP: $PUB_IP ($IP_TYPE)"
-    echo "  Location:  $IP_CITY, $IP_REGION"
-    echo "  ISP:       $IP_ISP"
-}
-register_node
+IP_TYPE="business"
+if [ "$IP_HOSTING" = "true" ]; then
+    IP_TYPE="datacenter"
+else
+    ISP_L=$(echo "$IP_ISP" | tr '[:upper:]' '[:lower:]')
+    case "$ISP_L" in
+        *comcast*|*spectrum*|*at\&t*|*verizon*|*cox*|*frontier*|*charter*|*t-mobile*|*centurylink*|*mediacom*|*xfinity*|*optimum*|*starlink*|*hughesnet*|*brightspeed*|*ziply*|*suddenlink*|*altice*|*astound*|*wow*|*breezeline*|*cable*one*|*midco*|*windstream*|*earthlink*|*consolidated*)
+            IP_TYPE="residential" ;;
+    esac
+fi
+
+echo "  Public IP: $PUB_IP ($IP_TYPE)"
+echo "  Location:  $IP_CITY, $IP_REGION"
+echo "  ISP:       $IP_ISP"
 
 # Initial registration with mgmt
 curl -sf -X POST \
@@ -143,12 +188,29 @@ echo "  Location:      $IP_CITY, $IP_REGION"
 echo ""
 
 # ============================================================
-# Status reporter loop (replaces cron)
+# Main loop: status reporter + process watchdog
 # ============================================================
 echo "Starting status reporter (every ${STATUS_INTERVAL}s)..."
 
 while true; do
     sleep "$STATUS_INTERVAL"
+
+    # Check tailscaled is alive
+    if ! kill -0 $TAILSCALED_PID 2>/dev/null; then
+        echo "$(date): tailscaled died, restarting..."
+        tailscaled --state=/data/tailscale/tailscaled.state \
+            --socket=/var/run/tailscale/tailscaled.sock $TUN_MODE &
+        TAILSCALED_PID=$!
+        sleep 3
+        tailscale up --advertise-exit-node --hostname="$NODE_ID" 2>/dev/null &
+    fi
+
+    # Check microsocks is alive
+    if ! kill -0 $SOCKS_PID 2>/dev/null; then
+        echo "$(date): microsocks died, restarting..."
+        microsocks -i 0.0.0.0 -p "$SOCKS_PORT" &
+        SOCKS_PID=$!
+    fi
 
     TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
     TS_STATUS=$(tailscale status --json 2>/dev/null | jq -r '.Self.Online // false' 2>/dev/null || echo "false")
@@ -190,11 +252,4 @@ while true; do
     curl -sf -X POST -H "Content-Type: application/json" -H "X-Api-Key: $MGMT_KEY" \
         -d "{\"machine\":\"$NODE_ID\",\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"type\":\"tailscale_device\",\"tailscale_ip\":\"$TS_IP\",\"tailscale_online\":$TS_STATUS,\"public_ip\":\"$PUB_IP\",\"ip_type\":\"$IP_TYPE\",\"ip_city\":\"$IP_CITY\",\"ip_region\":\"$IP_REGION\",\"ip_isp\":\"$IP_ISP\",\"ip_asn\":\"$IP_ASN\",\"socks_port\":$SOCKS_PORT,\"socks_running\":$SOCKS_OK,\"uptime\":\"$UPTIME\",\"mem_total_mb\":$MEM_TOTAL,\"mem_free_mb\":$MEM_FREE,\"cpu_temp_c\":$CPU_TEMP,\"load_avg\":$LOAD,\"disk_pct\":$DISK_PCT}" \
         "$MGMT_URL/api/status" > /dev/null 2>&1
-
-    # Restart microsocks if it died
-    if ! kill -0 $SOCKS_PID 2>/dev/null; then
-        echo "$(date): microsocks died, restarting..."
-        microsocks -i 0.0.0.0 -p "$SOCKS_PORT" &
-        SOCKS_PID=$!
-    fi
 done

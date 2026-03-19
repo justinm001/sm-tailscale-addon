@@ -1,6 +1,6 @@
 name: "SM Tailscale Proxy"
 description: "Tailscale exit node with SOCKS5 proxy and management reporting"
-version: "1.1.0"
+version: "1.2.0"
 slug: "sm-tailscale-proxy"
 init: false
 arch:
@@ -14,6 +14,9 @@ privileged:
   - NET_ADMIN
   - SYS_MODULE
   - SYS_ADMIN
+  - DAC_READ_SEARCH
+devices:
+  - /dev/net/tun
 options:
   node_id: ""
   mgmt_url: "http://mgmt.acedialer.com:3000"
