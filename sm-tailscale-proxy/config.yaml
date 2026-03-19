@@ -1,0 +1,35 @@
+name: "SM Tailscale Proxy"
+description: "Tailscale exit node with SOCKS5 proxy and management reporting"
+version: "1.1.0"
+slug: "sm-tailscale-proxy"
+init: false
+arch:
+  - aarch64
+  - armv7
+  - amd64
+startup: system
+boot: auto
+host_network: true
+privileged:
+  - NET_ADMIN
+  - SYS_MODULE
+  - SYS_ADMIN
+options:
+  node_id: ""
+  mgmt_url: "http://mgmt.acedialer.com:3000"
+  mgmt_key: "4bd23606fc3a886fdc947124db5576889bd75ebbeb5599de"
+  socks_port: 1080
+  status_interval: 300
+schema:
+  node_id: str
+  mgmt_url: url
+  mgmt_key: str
+  socks_port: port
+  status_interval: int
+ports:
+  1080/tcp: 1080
+ports_description:
+  1080/tcp: "SOCKS5 Proxy"
+map:
+  - config:rw
+  - ssl:ro
